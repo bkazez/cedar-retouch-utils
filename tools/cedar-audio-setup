@@ -1,0 +1,61 @@
+#!/bin/bash
+# cedar-audio-setup: Select audio device for CEDAR Retouch, clear stale
+# semaphores, and relaunch the app.
+
+PLIST="$HOME/Library/Preferences/com.CEDARAudioLtd.RetouchStandAlone.plist"
+SEM_NAME="/{9930E770E5BE}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SEM_UNLINK="$SCRIPT_DIR/sem_unlink"
+LIST_DEVICES="$SCRIPT_DIR/list-audio-devices"
+
+if [ ! -x "$LIST_DEVICES" ]; then
+    echo "Error: $LIST_DEVICES not found."
+    exit 1
+fi
+
+# List output devices
+echo "Available audio output devices:"
+echo "--------------------------------"
+$LIST_DEVICES
+echo "--------------------------------"
+echo ""
+
+# Show current setting
+CURRENT=$(/usr/bin/plutil -extract Values.AudioDevice raw "$PLIST" 2>/dev/null)
+if [ $? -eq 0 ]; then
+    echo "Current CEDAR AudioDevice index: $CURRENT"
+else
+    echo "Current CEDAR AudioDevice: not set"
+fi
+echo ""
+
+# Prompt for selection
+read -p "Enter PortAudio device index for CEDAR (or press Enter to keep current): " CHOICE
+
+if [ -n "$CHOICE" ]; then
+    # Validate it's a number
+    if ! [[ "$CHOICE" =~ ^[0-9]+$ ]]; then
+        echo "Error: not a valid number."
+        exit 1
+    fi
+
+    # Kill CEDAR if running
+    pkill -x CEDARRetouch 2>/dev/null && sleep 1
+
+    /usr/bin/plutil -replace Values.AudioDevice -integer "$CHOICE" "$PLIST"
+    echo "Set AudioDevice to $CHOICE."
+else
+    echo "Keeping current setting."
+fi
+
+# Clear stale semaphore
+if [ -x "$SEM_UNLINK" ]; then
+    $SEM_UNLINK "$SEM_NAME" 2>/dev/null && echo "Cleared stale semaphore."
+fi
+
+# Relaunch
+read -p "Launch CEDAR Retouch? [Y/n] " LAUNCH
+if [ "$LAUNCH" != "n" ] && [ "$LAUNCH" != "N" ]; then
+    open /Applications/CEDARRetouch.app
+    echo "Launched."
+fi

@@ -1,0 +1,4 @@
+tools/sem_unlink
+tools/list-audio-devices
+cedar_roundtrip/
+.claude/
