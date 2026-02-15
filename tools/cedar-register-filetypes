@@ -1,0 +1,75 @@
+#!/bin/bash
+# cedar-register-filetypes: Register CEDAR Retouch as a handler for audio files
+# in macOS Launch Services, without permanently modifying Info.plist (which would
+# break the code signature and iLok licensing).
+#
+# Run this once, or again after macOS clears its Launch Services cache.
+
+set -e
+
+APP="/Applications/CEDARRetouch.app"
+PLIST="$APP/Contents/Info.plist"
+PATCHED="/tmp/cedar_patched_info.plist"
+
+if [ ! -f "$PLIST" ]; then
+    echo "Error: CEDAR Retouch not found at $APP"
+    exit 1
+fi
+
+# Check if already registered
+if /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -dump | grep -q "CEDAR-Audio.CEDARRetouch.*com.microsoft.waveform-audio" 2>/dev/null; then
+    echo "CEDAR Retouch is already registered for audio files."
+    exit 0
+fi
+
+echo "Registering CEDAR Retouch as audio file handler..."
+
+# Create patched plist with CFBundleDocumentTypes
+cp "$PLIST" "$PATCHED"
+/usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes array" "$PATCHED"
+/usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0 dict" "$PATCHED"
+/usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:CFBundleTypeName string 'Audio File'" "$PATCHED"
+/usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:CFBundleTypeRole string Editor" "$PATCHED"
+/usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:LSHandlerRank string Alternate" "$PATCHED"
+/usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:LSItemContentTypes array" "$PATCHED"
+/usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:LSItemContentTypes:0 string com.microsoft.waveform-audio" "$PATCHED"
+/usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:LSItemContentTypes:1 string public.aiff-audio" "$PATCHED"
+/usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:LSItemContentTypes:2 string public.audio" "$PATCHED"
+
+# Swap in patched plist, register, swap back original
+osascript -e "
+tell application \"Finder\"
+    set origFile to POSIX file \"$PLIST\" as alias
+    set name of origFile to \"Info.plist.bak\"
+    delay 0.3
+    set patchedFile to POSIX file \"$PATCHED\" as alias
+    set destFolder to POSIX file \"$APP/Contents/\" as alias
+    move patchedFile to destFolder
+    set name of file \"cedar_patched_info.plist\" of destFolder to \"Info.plist\"
+end tell
+"
+
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP"
+
+# Restore original
+osascript -e "
+tell application \"Finder\"
+    set patchedFile to POSIX file \"$PLIST\" as alias
+    delete patchedFile
+    delay 0.3
+    set backupFile to POSIX file \"$APP/Contents/Info.plist.bak\" as alias
+    set name of backupFile to \"Info.plist\"
+end tell
+"
+
+# Verify signature is intact
+if codesign -v "$APP" 2>&1 | grep -q "valid"; then
+    echo "Done. Code signature verified."
+elif codesign -v "$APP" 2>/dev/null; then
+    echo "Done. Code signature valid."
+else
+    echo "Warning: code signature check failed. CEDAR may need reinstalling."
+    exit 1
+fi
+
+echo "CEDAR Retouch is now registered for audio files."

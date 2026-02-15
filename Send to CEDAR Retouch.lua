@@ -2,6 +2,11 @@
 -- Exports selected items across tracks to a single multichannel WAV,
 -- launches CEDAR Retouch, and copies the WAV path to clipboard.
 
+-- Logging
+local function log(msg)
+  reaper.ShowConsoleMsg("[CEDAR] " .. msg .. "\n")
+end
+
 -- Constants
 local BLOCK_SIZE = 65536
 local BIT_DEPTH = 24
@@ -128,6 +133,34 @@ local function generate_filename()
 end
 
 ---------------------------------------------------------------------------
+-- WAV header reader (fallback when REAPER API returns 0)
+---------------------------------------------------------------------------
+
+local function read_wav_header(path)
+  local f = io.open(path, "rb")
+  if not f then return 0, 0 end
+  local header = f:read(44)
+  f:close()
+  if not header or #header < 44 then return 0, 0 end
+  local riff = header:sub(1, 4)
+  local wave = header:sub(9, 12)
+  if riff ~= "RIFF" or wave ~= "WAVE" then return 0, 0 end
+  local num_channels = string.unpack("<I2", header, 23)
+  local sample_rate = string.unpack("<I4", header, 25)
+  return sample_rate, num_channels
+end
+
+local function read_wav_sample_rate(path)
+  local sr, _ = read_wav_header(path)
+  return sr
+end
+
+local function read_wav_num_channels(path)
+  local _, ch = read_wav_header(path)
+  return ch
+end
+
+---------------------------------------------------------------------------
 -- Validation
 ---------------------------------------------------------------------------
 
@@ -169,10 +202,38 @@ local function get_take_channel_info(take, num_src_channels)
   end
 end
 
+local function select_items_in_time_selection()
+  local ts_start, ts_end = reaper.GetSet_LoopTimeRange(false, false, 0, 0, false)
+  if ts_start == ts_end then
+    return false, "No items selected and no time selection."
+  end
+  local count = 0
+  local num_tracks = reaper.CountTracks(0)
+  for t = 0, num_tracks - 1 do
+    local track = reaper.GetTrack(0, t)
+    local num_items = reaper.CountTrackMediaItems(track)
+    for i = 0, num_items - 1 do
+      local item = reaper.GetTrackMediaItem(track, i)
+      local pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+      local len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+      if pos + len > ts_start and pos < ts_end then
+        reaper.SetMediaItemSelected(item, true)
+        count = count + 1
+      end
+    end
+  end
+  if count == 0 then
+    return false, "No items overlap the time selection."
+  end
+  return true, nil
+end
+
 local function validate_selection()
   local num_items = reaper.CountSelectedMediaItems(0)
   if num_items == 0 then
-    return nil, "No items selected. Select one or more audio items first."
+    local ok, err = select_items_in_time_selection()
+    if not ok then return nil, err end
+    num_items = reaper.CountSelectedMediaItems(0)
   end
 
   local sample_rate = nil
@@ -189,7 +250,23 @@ local function validate_selection()
     end
 
     local source = reaper.GetMediaItemTake_Source(take)
-    local sr = reaper.GetMediaSourceSampleRate(source)
+
+    -- Walk to root source (section sources return sr=0)
+    local root = source
+    while true do
+      local parent = reaper.GetMediaSourceParent(root)
+      if not parent then break end
+      root = parent
+    end
+
+    -- GetMediaSourceSampleRate can return 0 for sources not yet peaked.
+    -- Fall back to reading the WAV header directly.
+    local sr = reaper.GetMediaSourceSampleRate(root)
+    if sr == 0 then sr = reaper.GetMediaSourceSampleRate(source) end
+    if sr == 0 then
+      local src_file = reaper.GetMediaSourceFileName(source, "")
+      sr = read_wav_sample_rate(src_file)
+    end
     if sr == 0 then
       return nil, "Item " .. (i + 1) .. " has unknown sample rate."
     end
@@ -201,7 +278,15 @@ local function validate_selection()
         "). All items must share the same sample rate."
     end
 
+    -- Get channel count (try direct source, root, then WAV header)
     local num_src_channels = reaper.GetMediaSourceNumChannels(source)
+    if num_src_channels == 0 then
+      num_src_channels = reaper.GetMediaSourceNumChannels(root)
+    end
+    if num_src_channels == 0 then
+      local src_file = reaper.GetMediaSourceFileName(source, "")
+      num_src_channels = read_wav_num_channels(src_file)
+    end
     local playback_channels, src_read_channels, is_downmix = get_take_channel_info(take, num_src_channels)
 
     local track = reaper.GetMediaItem_Track(item)
@@ -211,6 +296,9 @@ local function validate_selection()
     local start_offset = reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS")
     local playrate = reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE")
     local chanmode = math.floor(reaper.GetMediaItemTakeInfo_Value(take, "I_CHANMODE"))
+    local _, take_name = reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME", "", false)
+    local item_vol = reaper.GetMediaItemInfo_Value(item, "D_VOL")
+    local take_vol = reaper.GetMediaItemTakeInfo_Value(take, "D_VOL")
 
     items[#items + 1] = {
       item = item,
@@ -224,6 +312,9 @@ local function validate_selection()
       length = length,
       start_offset = start_offset,
       playrate = playrate,
+      take_name = take_name,
+      item_vol = item_vol,
+      take_vol = take_vol,
       num_src_channels = num_src_channels,
       playback_channels = playback_channels,
       src_read_channels = src_read_channels,
@@ -315,11 +406,14 @@ local function export_multichannel_wav(data, guid_to_channel, num_channels, rang
   for _, info in ipairs(data.items) do
     local first_out_ch = guid_to_channel[info.track_guid]
     local accessor = reaper.CreateTakeAudioAccessor(info.take)
+    -- Force source load by requesting hash
+    reaper.GetAudioAccessorHash(accessor, "")
     item_entries[#item_entries + 1] = {
       accessor = accessor,
       position = info.position,
       length = info.length,
       start_offset = info.start_offset,
+      playrate = info.playrate,
       num_src_channels = info.num_src_channels,
       playback_channels = info.playback_channels,
       src_read_channels = info.src_read_channels,
@@ -351,14 +445,34 @@ local function export_multichannel_wav(data, guid_to_channel, num_channels, rang
         goto continue_item
       end
 
-      -- Read all source channels from the accessor
-      local read_start = block_start_time - item_start + entry.start_offset
+      -- Read from the accessor. For CreateTakeAudioAccessor, starttime_sec
+      -- is relative to the start of the take (the accessor handles D_STARTOFFS internally).
+      local read_start = (block_start_time - item_start) * (entry.playrate or 1.0)
       local n_src = entry.num_src_channels
       local buf = reaper.new_array(block_len * n_src)
       buf.clear()
-      reaper.GetAudioAccessorSamples(
+      local got = reaper.GetAudioAccessorSamples(
         entry.accessor, sample_rate, n_src, read_start, block_len, buf)
       local raw = buf.table()
+
+      if not entry.logged_first_block then
+        entry.logged_first_block = true
+        local peak = 0
+        for si = 1, #raw do
+          if math.abs(raw[si]) > peak then peak = math.abs(raw[si]) end
+        end
+        log(string.format("  ch=%d got=%d read_start=%.4f peak=%.6f n_src=%d",
+          entry.first_out_ch, got, read_start, peak, n_src))
+        if got == 0 then
+          -- Close file, destroy accessors, report error
+          f:close()
+          for _, e in ipairs(item_entries) do
+            reaper.DestroyAudioAccessor(e.accessor)
+          end
+          return false, "GetAudioAccessorSamples returned 0 for output channel " ..
+            entry.first_out_ch .. ". Source may not be loaded."
+        end
+      end
 
       -- Map source channels to output channels based on take channel mode
       if entry.is_downmix then
@@ -424,6 +538,9 @@ local function build_metadata(data, guid_to_channel, num_channels, range_start, 
       position = info.position,
       length = info.length,
       start_offset = info.start_offset,
+      take_name = info.take_name,
+      item_vol = info.item_vol,
+      take_vol = info.take_vol,
     }
   end
 
@@ -476,15 +593,30 @@ local function launch_cedar(wav_path)
   end
   f_check:close()
 
-  -- Copy WAV path to clipboard (using pbcopy to avoid SWS dependency)
+  -- Copy WAV path to clipboard as fallback
   local pipe = io.popen("pbcopy", "w")
   if pipe then
     pipe:write(wav_path)
     pipe:close()
   end
 
-  -- Launch CEDAR
-  os.execute('open -a "' .. CEDAR_APP_PATH .. '"')
+  -- Launch CEDAR, then open the file after a delay (CEDAR needs time to start).
+  -- Written to a temp script because os.execute("... &") is unreliable in REAPER Lua.
+  local escaped_app = CEDAR_APP_PATH:gsub("'", "'\\''")
+  local escaped_path = wav_path:gsub("'", "'\\''")
+
+  local tmpdir = os.getenv("TMPDIR") or "/tmp"
+  if tmpdir:sub(-1) ~= "/" then tmpdir = tmpdir .. "/" end
+  local sh_path = tmpdir .. "cedar_launch.sh"
+  local sh = io.open(sh_path, "w")
+  if sh then
+    sh:write("#!/bin/sh\n")
+    sh:write("open -a '" .. escaped_app .. "'\n")
+    sh:write("sleep 3\n")
+    sh:write("open -a '" .. escaped_app .. "' '" .. escaped_path .. "'\n")
+    sh:close()
+    os.execute("chmod +x '" .. sh_path .. "' && '" .. sh_path .. "' &")
+  end
 
   return true, nil
 end
@@ -497,7 +629,7 @@ local function main()
   -- Validate selection
   local data, err = validate_selection()
   if not data then
-    reaper.ShowMessageBox(err, "Send to CEDAR Retouch", 0)
+    log("ERROR: " .. err)
     return
   end
 
@@ -505,17 +637,28 @@ local function main()
   local guid_to_channel, num_channels = build_channel_map(data.items)
   local range_start, range_end = compute_time_range(data.items)
 
-  -- Clamp to time selection if one exists
+  -- Log item details for diagnostics
+  for idx, info in ipairs(data.items) do
+    local src_file = reaper.GetMediaSourceFileName(info.source, "")
+    log(string.format("Item %d: track=%d chanmode=%d src_ch=%d play_ch=%d read={%s} out_ch=%d src=%s",
+      idx, info.track_idx, info.chanmode, info.num_src_channels, info.playback_channels,
+      table.concat(info.src_read_channels, ","), guid_to_channel[info.track_guid],
+      src_file:match("[^/]+$") or src_file))
+  end
+
+  -- Use time selection if one exists, otherwise use the selected items' range
   local ts_start, ts_end = get_time_selection()
   if ts_start then
     range_start = math.max(range_start, ts_start)
     range_end = math.min(range_end, ts_end)
     if range_start >= range_end then
-      reaper.ShowMessageBox(
-        "Time selection does not overlap any selected items.",
-        "Send to CEDAR Retouch", 0)
+      log("ERROR: Time selection does not overlap any selected items.")
       return
     end
+  else
+    -- No time selection: use the items' range as the time selection
+    ts_start = range_start
+    ts_end = range_end
   end
 
   -- Prepare output path
@@ -527,7 +670,7 @@ local function main()
   local ok, export_err = export_multichannel_wav(
     data, guid_to_channel, num_channels, range_start, range_end, wav_path)
   if not ok then
-    reaper.ShowMessageBox(export_err, "Send to CEDAR Retouch", 0)
+    log("ERROR: " .. export_err)
     return
   end
 
@@ -543,20 +686,15 @@ local function main()
   -- Launch CEDAR and copy path
   local launched, launch_err = launch_cedar(wav_path)
   if not launched then
-    reaper.ShowMessageBox(launch_err .. "\n\nWAV exported to:\n" .. wav_path,
-      "Send to CEDAR Retouch", 0)
+    log("ERROR: " .. launch_err .. " -- WAV exported to: " .. wav_path)
     return
   end
 
   local total_duration = range_end - range_start
-  reaper.ShowMessageBox(
-    "Exported " .. num_channels .. " channel(s), " ..
-    string.format("%.1f", total_duration) .. "s to:\n" .. wav_path ..
-    "\n\nThe file path has been copied to clipboard." ..
-    "\nIn CEDAR Retouch, use File > Open and paste the path." ..
-    "\n\nWhen done processing, save the file (overwrite) and run" ..
-    "\n'Return from CEDAR Retouch' in REAPER.",
-    "Send to CEDAR Retouch", 0)
+  log("Exported " .. num_channels .. " ch, " ..
+    string.format("%.1f", total_duration) .. "s -> " .. wav_path)
+  log("Opening in CEDAR Retouch. Path also on clipboard.")
+  log("When done, save (overwrite) and run 'Return from CEDAR Retouch'.")
 end
 
 main()
