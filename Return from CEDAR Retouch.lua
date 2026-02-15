@@ -450,12 +450,17 @@ local function replace_items(metadata, wav_path)
         local replace_start = math.max(item_pos, sel_start)
         local replace_end = math.min(item_end, sel_end)
         if replace_start < replace_end then
-          if replace_end < item_end then
+          if replace_end < item_end - 0.0001 then
             reaper.SplitMediaItem(item, replace_end)
           end
           local middle_item = item
-          if replace_start > item_pos then
-            middle_item = reaper.SplitMediaItem(item, replace_start)
+          if replace_start > item_pos + 0.0001 then
+            local split_result = reaper.SplitMediaItem(item, replace_start)
+            if split_result then
+              middle_item = split_result
+            else
+              reaper.ShowConsoleMsg("[CEDAR] Warning: split at " .. replace_start .. " failed, deleting entire overlapping item\n")
+            end
           end
           reaper.DeleteTrackMediaItem(track, middle_item)
         end
