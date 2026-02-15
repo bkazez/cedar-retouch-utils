@@ -89,7 +89,7 @@ cc -o sem_unlink sem_unlink.c
 cc -o list-audio-devices list-audio-devices.c $(pkg-config --cflags --libs portaudio-2.0)
 ```
 
-## Known Issues
+## Workarounds for Known CEDAR Bugs
 
 - CEDAR stores audio device as a PortAudio index, not by name. Breaks silently when hardware changes. Use `cedar-audio-setup` to fix.
 - CEDAR leaks a POSIX semaphore (`/{9930E770E5BE}`) if force-killed. Next launch hangs. Use `sem_unlink` or `cedar-audio-setup`.
