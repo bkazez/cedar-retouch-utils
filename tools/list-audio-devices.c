@@ -29,7 +29,8 @@ int main(void)
         const PaHostApiInfo *api = Pa_GetHostApiInfo(info->hostApi);
         const char *api_name = api ? api->name : "?";
         const char *marker = (i == default_out) ? " *" : "";
-        printf("%3d  %-40s  [%s]%s\n", i, info->name, api_name, marker);
+        printf("%3d  %-40s  %2d ch  [%s]%s\n",
+               i, info->name, info->maxOutputChannels, api_name, marker);
     }
 
     Pa_Terminate();
